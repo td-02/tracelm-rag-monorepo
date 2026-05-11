@@ -1,0 +1,56 @@
+version: "3.9"
+
+services:
+  coordinator:
+    build:
+      context: .
+      dockerfile: coordinator/Dockerfile
+    working_dir: /app/coordinator
+    ports:
+      - "8001:8000"
+    depends_on:
+      - redis
+      - chromadb
+      - worker1
+      - worker2
+      - worker3
+
+  worker1:
+    build:
+      context: .
+      dockerfile: worker/Dockerfile
+    working_dir: /app/worker
+    environment:
+      - WORKER_ID=worker1
+    depends_on:
+      - chromadb
+
+  worker2:
+    build:
+      context: .
+      dockerfile: worker/Dockerfile
+    working_dir: /app/worker
+    environment:
+      - WORKER_ID=worker2
+    depends_on:
+      - chromadb
+
+  worker3:
+    build:
+      context: .
+      dockerfile: worker/Dockerfile
+    working_dir: /app/worker
+    environment:
+      - WORKER_ID=worker3
+    depends_on:
+      - chromadb
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+
+  chromadb:
+    image: chromadb/chroma:0.5.5
+    ports:
+      - "8000:8000"
