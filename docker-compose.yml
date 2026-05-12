@@ -6,51 +6,152 @@ services:
       context: .
       dockerfile: coordinator/Dockerfile
     working_dir: /app/coordinator
-    ports:
-      - "8001:8000"
-    depends_on:
-      - redis
-      - chromadb
-      - worker1
-      - worker2
-      - worker3
-
-  worker1:
-    build:
-      context: .
-      dockerfile: worker/Dockerfile
-    working_dir: /app/worker
     environment:
-      - WORKER_ID=worker1
-    depends_on:
-      - chromadb
-
-  worker2:
-    build:
-      context: .
-      dockerfile: worker/Dockerfile
-    working_dir: /app/worker
-    environment:
-      - WORKER_ID=worker2
-    depends_on:
-      - chromadb
-
-  worker3:
-    build:
-      context: .
-      dockerfile: worker/Dockerfile
-    working_dir: /app/worker
-    environment:
-      - WORKER_ID=worker3
-    depends_on:
-      - chromadb
-
-  redis:
-    image: redis:7-alpine
-    ports:
-      - "6379:6379"
-
-  chromadb:
-    image: chromadb/chroma:0.5.5
+      REDIS_URL: redis://redis:6379/0
+      WORKER_URLS: http://worker_1:8000,http://worker_2:8000,http://worker_3:8000
+      WORKERS: worker_1,worker_2,worker_3
+      REDIS_HOST: redis
+      REDIS_PORT: "6379"
+      TRACE_DB_PATH: /traces/coordinator_traces.db
     ports:
       - "8000:8000"
+    volumes:
+      - coordinator_traces:/traces
+    depends_on:
+      redis:
+        condition: service_healthy
+      chromadb:
+        condition: service_healthy
+      worker_1:
+        condition: service_healthy
+      worker_2:
+        condition: service_healthy
+      worker_3:
+        condition: service_healthy
+    networks:
+      - rag_network
+
+  worker_1:
+    build:
+      context: .
+      dockerfile: worker/Dockerfile
+    working_dir: /app/worker
+    environment:
+      WORKER_ID: worker_1
+      CHROMA_COLLECTION: shard_1
+      CHROMA_HOST: chromadb
+      CHROMA_PORT: "8000"
+      TRACE_DB_PATH: /traces/worker_1_traces.db
+    ports:
+      - "8001:8000"
+    volumes:
+      - worker_1_traces:/traces
+    depends_on:
+      chromadb:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=5)"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    networks:
+      - rag_network
+
+  worker_2:
+    build:
+      context: .
+      dockerfile: worker/Dockerfile
+    working_dir: /app/worker
+    environment:
+      WORKER_ID: worker_2
+      CHROMA_COLLECTION: shard_2
+      CHROMA_HOST: chromadb
+      CHROMA_PORT: "8000"
+      TRACE_DB_PATH: /traces/worker_2_traces.db
+    ports:
+      - "8002:8000"
+    volumes:
+      - worker_2_traces:/traces
+    depends_on:
+      chromadb:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=5)"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    networks:
+      - rag_network
+
+  worker_3:
+    build:
+      context: .
+      dockerfile: worker/Dockerfile
+    working_dir: /app/worker
+    environment:
+      WORKER_ID: worker_3
+      CHROMA_COLLECTION: shard_3
+      CHROMA_HOST: chromadb
+      CHROMA_PORT: "8000"
+      TRACE_DB_PATH: /traces/worker_3_traces.db
+    ports:
+      - "8003:8000"
+    volumes:
+      - worker_3_traces:/traces
+    depends_on:
+      chromadb:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=5)"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    networks:
+      - rag_network
+
+  redis:
+    image: redis:alpine
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - rag_network
+
+  chromadb:
+    image: chromadb/chroma
+    ports:
+      - "8004:8000"
+    volumes:
+      - chromadb_data:/chroma/chroma
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/api/v1/heartbeat', timeout=5)"]
+      interval: 15s
+      timeout: 5s
+      retries: 8
+      start_period: 20s
+    networks:
+      - rag_network
+
+networks:
+  rag_network:
+    driver: bridge
+
+volumes:
+  chromadb_data:
+  coordinator_traces:
+  worker_1_traces:
+  worker_2_traces:
+  worker_3_traces:
