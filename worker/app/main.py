@@ -1,9 +1,5 @@
 import os
-import sqlite3
 import time
-import uuid
-from contextlib import contextmanager
-from threading import Lock
 from typing import Any
 
 import psutil
@@ -13,11 +9,12 @@ from pydantic import BaseModel, Field
 from sentence_transformers import SentenceTransformer
 from transformers import AutoTokenizer
 
+from shared import TraceContext, init_tracer
+
 app = FastAPI(title="worker")
 
 WORKER_ID = os.getenv("WORKER_ID", "worker")
 MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"
-TRACE_DB_PATH = os.getenv("TRACE_DB_PATH", "traces.db")
 CHROMA_HOST = os.getenv("CHROMA_HOST", "chromadb")
 CHROMA_PORT = int(os.getenv("CHROMA_PORT", "8000"))
 
@@ -25,101 +22,7 @@ chroma = HttpClient(host=CHROMA_HOST, port=CHROMA_PORT)
 collection = chroma.get_or_create_collection(name=WORKER_ID)
 model = SentenceTransformer(MODEL_NAME)
 tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
-
-_db_lock = Lock()
-
-
-def _init_trace_store() -> None:
-    with _db_lock:
-        conn = sqlite3.connect(TRACE_DB_PATH)
-        try:
-            conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS spans (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    trace_id TEXT NOT NULL,
-                    span_id TEXT NOT NULL,
-                    parent_span_id TEXT,
-                    name TEXT NOT NULL,
-                    worker_id TEXT NOT NULL,
-                    start_ms REAL NOT NULL,
-                    end_ms REAL NOT NULL,
-                    duration_ms REAL NOT NULL
-                )
-                """
-            )
-            conn.commit()
-        finally:
-            conn.close()
-
-
-def _new_span_id() -> str:
-    return uuid.uuid4().hex[:16]
-
-
-def _new_trace_id() -> str:
-    return uuid.uuid4().hex
-
-
-def _parse_traceparent(traceparent: str | None) -> tuple[str, str] | None:
-    if not traceparent:
-        return None
-    parts = traceparent.split("-")
-    if len(parts) != 4:
-        return None
-    version, trace_id, parent_span_id, flags = parts
-    if version != "00" or len(trace_id) != 32 or len(parent_span_id) != 16 or len(flags) != 2:
-        return None
-    return trace_id, parent_span_id
-
-
-def _build_traceparent(trace_id: str, span_id: str, flags: str = "01") -> str:
-    return f"00-{trace_id}-{span_id}-{flags}"
-
-
-def _save_span(
-    trace_id: str,
-    span_id: str,
-    parent_span_id: str | None,
-    name: str,
-    start_ms: float,
-    end_ms: float,
-) -> None:
-    duration_ms = end_ms - start_ms
-    with _db_lock:
-        conn = sqlite3.connect(TRACE_DB_PATH)
-        try:
-            conn.execute(
-                """
-                INSERT INTO spans (
-                    trace_id, span_id, parent_span_id, name, worker_id, start_ms, end_ms, duration_ms
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    trace_id,
-                    span_id,
-                    parent_span_id,
-                    name,
-                    WORKER_ID,
-                    start_ms,
-                    end_ms,
-                    duration_ms,
-                ),
-            )
-            conn.commit()
-        finally:
-            conn.close()
-
-
-@contextmanager
-def _span(trace_id: str, parent_span_id: str | None, name: str):
-    span_id = _new_span_id()
-    start_ms = time.time() * 1000.0
-    try:
-        yield span_id
-    finally:
-        end_ms = time.time() * 1000.0
-        _save_span(trace_id, span_id, parent_span_id, name, start_ms, end_ms)
+tracer = init_tracer(service_name=WORKER_ID)
 
 
 def _split_chunks(text: str, chunk_tokens: int = 256, overlap_tokens: int = 32) -> list[str]:
@@ -174,46 +77,49 @@ class HealthResponse(BaseModel):
     memory_usage_mb: float
 
 
-_init_trace_store()
-
-
 @app.post("/ingest", response_model=IngestResponse)
 def ingest(
     payload: IngestRequest,
     response: Response,
     traceparent: str | None = Header(default=None),
 ) -> IngestResponse:
-    incoming = _parse_traceparent(traceparent)
-    trace_id = incoming[0] if incoming else _new_trace_id()
-    parent_span = incoming[1] if incoming else None
-    root_span = _new_span_id()
-    response.headers["traceparent"] = _build_traceparent(trace_id, root_span)
+    parent_context = tracer.extract_context({"traceparent": traceparent} if traceparent else None)
+    root_span = tracer.create_span("worker.ingest", parent_context)
+    response.headers.update(tracer.inject_headers(root_span))
 
     start_ms = time.time() * 1000.0
-    with _span(trace_id, parent_span, "ingest"):
-        with _span(trace_id, root_span, "ingest.chunk"):
+    with tracer.span(root_span, {"document_id": payload.document_id, "worker_id": WORKER_ID}) as root_attrs:
+        chunk_span = tracer.create_span("worker.ingest.chunking", TraceContext(root_span.trace_id, root_span.span_id))
+        with tracer.span(chunk_span) as attrs:
             chunks = _split_chunks(payload.text)
+            attrs["chunk_count"] = len(chunks)
 
+        embeddings = []
         if chunks:
-            with _span(trace_id, root_span, "ingest.embed"):
+            embed_span = tracer.create_span("worker.ingest.embedding", TraceContext(root_span.trace_id, root_span.span_id))
+            embed_t0 = time.perf_counter()
+            with tracer.span(embed_span) as attrs:
                 embeddings = model.encode(chunks, convert_to_numpy=False)
+                attrs["chunk_count"] = len(chunks)
+            root_attrs["embedding_latency_ms"] = (time.perf_counter() - embed_t0) * 1000.0
 
             metadatas = []
             ids = []
-            for idx, chunk in enumerate(chunks):
+            for idx, _chunk in enumerate(chunks):
                 data = dict(payload.metadata)
                 data["document_id"] = payload.document_id
                 data["chunk_index"] = idx
                 metadatas.append(data)
                 ids.append(f"{payload.document_id}:{idx}")
 
-            with _span(trace_id, root_span, "ingest.store"):
-                collection.upsert(
-                    ids=ids,
-                    embeddings=embeddings,
-                    documents=chunks,
-                    metadatas=metadatas,
-                )
+            db_span = tracer.create_span("worker.ingest.chroma_write", TraceContext(root_span.trace_id, root_span.span_id))
+            db_t0 = time.perf_counter()
+            with tracer.span(db_span) as attrs:
+                collection.upsert(ids=ids, embeddings=embeddings, documents=chunks, metadatas=metadatas)
+                attrs["rows_upserted"] = len(ids)
+            root_attrs["db_latency_ms"] = (time.perf_counter() - db_t0) * 1000.0
+
+        root_attrs["chunk_count"] = len(chunks)
 
     latency_ms = (time.time() * 1000.0) - start_ms
     return IngestResponse(chunks_stored=len(chunks), latency_ms=latency_ms)
@@ -225,34 +131,34 @@ def query(
     response: Response,
     traceparent: str | None = Header(default=None),
 ) -> QueryResponse:
-    incoming = _parse_traceparent(traceparent)
-    trace_id = incoming[0] if incoming else _new_trace_id()
-    parent_span = incoming[1] if incoming else None
-    root_span = _new_span_id()
-    response.headers["traceparent"] = _build_traceparent(trace_id, root_span)
+    parent_context = tracer.extract_context({"traceparent": traceparent} if traceparent else None)
+    root_span = tracer.create_span("worker.query", parent_context)
+    response.headers.update(tracer.inject_headers(root_span))
 
     start_ms = time.time() * 1000.0
-    with _span(trace_id, parent_span, "query"):
-        with _span(trace_id, root_span, "query.embed"):
+    with tracer.span(root_span, {"worker_id": WORKER_ID, "top_k": payload.top_k}) as root_attrs:
+        embed_span = tracer.create_span("worker.query.embedding", TraceContext(root_span.trace_id, root_span.span_id))
+        embed_t0 = time.perf_counter()
+        with tracer.span(embed_span):
             query_embedding = model.encode([payload.query], convert_to_numpy=False)[0]
+        root_attrs["embedding_latency_ms"] = (time.perf_counter() - embed_t0) * 1000.0
 
-        with _span(trace_id, root_span, "query.search"):
+        db_span = tracer.create_span("worker.query.chroma_read", TraceContext(root_span.trace_id, root_span.span_id))
+        db_t0 = time.perf_counter()
+        with tracer.span(db_span):
             found = collection.query(
                 query_embeddings=[query_embedding],
                 n_results=payload.top_k,
                 include=["documents", "metadatas", "distances"],
             )
+        root_attrs["db_latency_ms"] = (time.perf_counter() - db_t0) * 1000.0
 
     docs = found.get("documents", [[]])[0]
     metas = found.get("metadatas", [[]])[0]
     dists = found.get("distances", [[]])[0]
 
     results = [
-        QueryResult(
-            text=doc,
-            score=1.0 / (1.0 + float(dist)),
-            metadata=meta or {},
-        )
+        QueryResult(text=doc, score=1.0 / (1.0 + float(dist)), metadata=meta or {})
         for doc, meta, dist in zip(docs, metas, dists)
     ]
 
@@ -265,20 +171,12 @@ def health(
     response: Response,
     traceparent: str | None = Header(default=None),
 ) -> HealthResponse:
-    incoming = _parse_traceparent(traceparent)
-    trace_id = incoming[0] if incoming else _new_trace_id()
-    parent_span = incoming[1] if incoming else None
-    root_span = _new_span_id()
-    response.headers["traceparent"] = _build_traceparent(trace_id, root_span)
+    parent_context = tracer.extract_context({"traceparent": traceparent} if traceparent else None)
+    span = tracer.create_span("worker.health", parent_context)
+    response.headers.update(tracer.inject_headers(span))
 
-    with _span(trace_id, parent_span, "health"):
-        with _span(trace_id, root_span, "health.count"):
-            documents_indexed = int(collection.count())
-
+    with tracer.span(span):
+        documents_indexed = int(collection.count())
         memory_usage_mb = psutil.Process(os.getpid()).memory_info().rss / (1024 * 1024)
 
-    return HealthResponse(
-        worker_id=WORKER_ID,
-        documents_indexed=documents_indexed,
-        memory_usage_mb=round(memory_usage_mb, 2),
-    )
+    return HealthResponse(worker_id=WORKER_ID, documents_indexed=documents_indexed, memory_usage_mb=round(memory_usage_mb, 2))
