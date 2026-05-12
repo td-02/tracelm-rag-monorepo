@@ -1,138 +1,111 @@
-import json
 import logging
 import os
 import sqlite3
-import time
-import uuid
 from contextlib import contextmanager
 from dataclasses import dataclass
 from threading import Lock
 from typing import Any, Mapping
+
+from tracelm.context import generate_trace_id
+from tracelm.distributed.tracecontext import build_traceparent, parse_traceparent
+from tracelm.span import Span
+from tracelm.storage import sqlite_store
+from tracelm.storage.sqlite_store import save_trace
+from tracelm.trace import Trace
 
 
 @dataclass
 class TraceContext:
     trace_id: str
     span_id: str | None
-    trace_flags: str = "01"
-
-
-@dataclass
-class Span:
-    trace_id: str
-    span_id: str
-    parent_span_id: str | None
-    name: str
-    service_name: str
-    trace_flags: str = "01"
 
 
 class TraceLMTracer:
     def __init__(self, service_name: str, db_path: str | None = None) -> None:
         self.service_name = service_name
-        self.db_path = db_path or os.getenv("TRACE_DB_PATH", "traces.db")
+        self.db_path = db_path or os.getenv("TRACE_DB_PATH", "tracelm_traces.db")
+        sqlite_store.DB_FILE = self.db_path
+        sqlite_store.init_db()
         self._lock = Lock()
-        self._init_store()
-
-    def _init_store(self) -> None:
-        with self._lock:
-            conn = sqlite3.connect(self.db_path)
-            try:
-                conn.execute(
-                    """
-                    CREATE TABLE IF NOT EXISTS spans (
-                        id INTEGER PRIMARY KEY AUTOINCREMENT,
-                        trace_id TEXT NOT NULL,
-                        span_id TEXT NOT NULL,
-                        parent_span_id TEXT,
-                        name TEXT NOT NULL,
-                        service_name TEXT NOT NULL,
-                        start_ms REAL NOT NULL,
-                        end_ms REAL NOT NULL,
-                        duration_ms REAL NOT NULL,
-                        attributes_json TEXT NOT NULL
-                    )
-                    """
-                )
-                conn.commit()
-            finally:
-                conn.close()
-
-    @staticmethod
-    def _new_trace_id() -> str:
-        return uuid.uuid4().hex
-
-    @staticmethod
-    def _new_span_id() -> str:
-        return uuid.uuid4().hex[:16]
+        self._traces: dict[str, Trace] = {}
+        self._open_counts: dict[str, int] = {}
 
     def create_span(self, name: str, parent_context: TraceContext | None = None) -> Span:
-        trace_id = parent_context.trace_id if parent_context else self._new_trace_id()
-        trace_flags = parent_context.trace_flags if parent_context else "01"
-        parent_span_id = parent_context.span_id if parent_context else None
-        return Span(
-            trace_id=trace_id,
-            span_id=self._new_span_id(),
-            parent_span_id=parent_span_id,
-            name=name,
-            service_name=self.service_name,
-            trace_flags=trace_flags,
-        )
+        with self._lock:
+            if parent_context:
+                trace_id = parent_context.trace_id
+                parent_id = parent_context.span_id
+            else:
+                trace_id = generate_trace_id()
+                parent_id = None
+
+            trace = self._traces.get(trace_id)
+            if trace is None:
+                trace = Trace(trace_id=trace_id)
+                self._traces[trace_id] = trace
+                self._open_counts[trace_id] = 0
+
+            span = Span(trace_id=trace_id, parent_id=parent_id, name=name)
+            span.metadata["service_name"] = self.service_name
+            trace.add_span(span)
+            return span
 
     def inject_headers(self, span: Span) -> dict[str, str]:
-        return {"traceparent": f"00-{span.trace_id}-{span.span_id}-{span.trace_flags}"}
+        return {"traceparent": build_traceparent(span.trace_id, span.span_id)}
 
     def extract_context(self, headers: Mapping[str, str] | None) -> TraceContext | None:
         if not headers:
             return None
-        raw = headers.get("traceparent") or headers.get("Traceparent")
-        if not raw:
+        value = headers.get("traceparent") or headers.get("Traceparent")
+        if not value:
             return None
-        parts = raw.split("-")
-        if len(parts) != 4:
+        parsed = parse_traceparent(value)
+        if parsed is None:
             return None
-        version, trace_id, span_id, flags = parts
-        if version != "00" or len(trace_id) != 32 or len(span_id) != 16 or len(flags) != 2:
-            return None
-        return TraceContext(trace_id=trace_id, span_id=span_id, trace_flags=flags)
+        trace_id, parent_span_id = parsed
+        return TraceContext(trace_id=trace_id, span_id=parent_span_id)
 
     @contextmanager
     def span(self, span: Span, attributes: dict[str, Any] | None = None):
-        attrs: dict[str, Any] = attributes.copy() if attributes else {}
-        start_ms = time.time() * 1000.0
-        try:
-            yield attrs
-        finally:
-            end_ms = time.time() * 1000.0
-            self._save_span(span, start_ms, end_ms, attrs)
+        attrs = attributes or {}
+        for k, v in attrs.items():
+            span.metadata[k] = v
 
-    def _save_span(self, span: Span, start_ms: float, end_ms: float, attributes: dict[str, Any]) -> None:
-        payload = json.dumps(attributes, ensure_ascii=True)
-        duration_ms = end_ms - start_ms
         with self._lock:
-            conn = sqlite3.connect(self.db_path)
-            try:
-                conn.execute(
-                    """
-                    INSERT INTO spans (
-                        trace_id, span_id, parent_span_id, name, service_name, start_ms, end_ms, duration_ms, attributes_json
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    (
-                        span.trace_id,
-                        span.span_id,
-                        span.parent_span_id,
-                        span.name,
-                        span.service_name,
-                        start_ms,
-                        end_ms,
-                        duration_ms,
-                        payload,
-                    ),
-                )
-                conn.commit()
-            finally:
-                conn.close()
+            self._open_counts[span.trace_id] = self._open_counts.get(span.trace_id, 0) + 1
+
+        try:
+            yield span.metadata
+        except Exception as exc:
+            span.error = f"{type(exc).__name__}: {exc}"
+            raise
+        finally:
+            span.finish()
+            should_flush = False
+            with self._lock:
+                self._open_counts[span.trace_id] = max(0, self._open_counts.get(span.trace_id, 1) - 1)
+                if self._open_counts[span.trace_id] == 0:
+                    should_flush = True
+
+            if should_flush:
+                with self._lock:
+                    trace = self._traces.pop(span.trace_id, None)
+                    self._open_counts.pop(span.trace_id, None)
+                if trace is not None:
+                    trace.validate()
+                    save_trace(trace)
+
+    def fetch_recent_traces(self, limit: int = 100) -> list[dict[str, Any]]:
+        sqlite_store.init_db()
+        with sqlite3.connect(self.db_path) as conn:
+            rows = conn.execute(
+                "SELECT data FROM traces ORDER BY timestamp DESC LIMIT ?",
+                (limit,),
+            ).fetchall()
+
+        import json
+
+        return [json.loads(row[0]) for row in rows]
 
 
 def init_tracer(service_name: str, db_path: str | None = None) -> TraceLMTracer:
