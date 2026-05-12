@@ -10,10 +10,11 @@ import redis
 from fastapi import FastAPI
 from pydantic import BaseModel, Field
 
-from shared import ConsistentHashRing, get_logger
+from shared import ConsistentHashRing, TraceContext, get_logger, init_tracer
 
 app = FastAPI(title="coordinator")
 logger = get_logger("coordinator")
+tracer = init_tracer(service_name="coordinator")
 
 REDIS_HOST = os.getenv("REDIS_HOST", "redis")
 REDIS_PORT = int(os.getenv("REDIS_PORT", "6379"))
@@ -102,6 +103,10 @@ class FailoverLogResponse(BaseModel):
     failures: list[FailoverEvent]
 
 
+class TraceListResponse(BaseModel):
+    traces: list[dict[str, Any]]
+
+
 def _worker_url(worker_id: str, path: str) -> str:
     return f"http://{worker_id}:{WORKER_PORT}{path}"
 
@@ -140,12 +145,11 @@ async def _post_json(
     worker_id: str,
     path: str,
     payload: dict[str, Any],
-    traceparent: str | None,
+    trace_headers: dict[str, str],
 ) -> tuple[dict[str, Any], float]:
-    headers = {"traceparent": traceparent} if traceparent else {}
     start = time.perf_counter()
     try:
-        resp = await client.post(_worker_url(worker_id, path), json=payload, headers=headers)
+        resp = await client.post(_worker_url(worker_id, path), json=payload, headers=trace_headers)
         elapsed_ms = (time.perf_counter() - start) * 1000.0
         resp.raise_for_status()
         return resp.json(), elapsed_ms
@@ -197,95 +201,95 @@ async def shutdown_event() -> None:
 @app.post("/ingest", response_model=IngestResponse)
 async def ingest(payload: IngestRequest) -> IngestResponse:
     start = time.perf_counter()
-    candidates = ring.get_nodes(payload.document_id, len(WORKERS))
+    root_span = tracer.create_span("coordinator.ingest", None)
 
-    async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT_S) as client:
-        last_exc: Exception | None = None
-        for worker_id in candidates:
-            if _is_degraded(worker_id):
-                continue
-            try:
-                worker_data, _ = await _post_json(client, worker_id, "/ingest", payload.model_dump(), None)
-                await asyncio.to_thread(redis_client.set, payload.document_id, worker_id)
-                total_latency_ms = (time.perf_counter() - start) * 1000.0
-                logger.info("Ingest routed", extra={"request_id": payload.document_id})
-                return IngestResponse(
-                    worker_id=worker_id,
-                    chunks_stored=int(worker_data.get("chunks_stored", 0)),
-                    total_latency_ms=total_latency_ms,
-                )
-            except httpx.TimeoutException as exc:
-                last_exc = exc
-                continue
-            except Exception as exc:
-                _mark_worker_degraded(worker_id, f"ingest_failed: {exc}")
-                last_exc = exc
-                continue
+    with tracer.span(root_span, {"document_id": payload.document_id}) as span_attrs:
+        candidates = ring.get_nodes(payload.document_id, len(WORKERS))
+        span_attrs["routing_candidates"] = candidates
 
-    if last_exc:
-        raise httpx.HTTPError(f"all workers unavailable for ingest: {last_exc}")
-    raise httpx.HTTPError("all workers unavailable for ingest")
+        async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT_S) as client:
+            last_exc: Exception | None = None
+            for worker_id in candidates:
+                if _is_degraded(worker_id):
+                    continue
+
+                child_span = tracer.create_span("coordinator.ingest.forward", TraceContext(root_span.trace_id, root_span.span_id))
+                with tracer.span(child_span, {"worker_id": worker_id}):
+                    try:
+                        trace_headers = tracer.inject_headers(child_span)
+                        worker_data, _ = await _post_json(client, worker_id, "/ingest", payload.model_dump(), trace_headers)
+                        await asyncio.to_thread(redis_client.set, payload.document_id, worker_id)
+                        total_latency_ms = (time.perf_counter() - start) * 1000.0
+                        span_attrs["worker_selected"] = worker_id
+                        span_attrs["routing_decision"] = f"hash->{worker_id}"
+                        span_attrs["total_latency_ms"] = total_latency_ms
+                        return IngestResponse(
+                            worker_id=worker_id,
+                            chunks_stored=int(worker_data.get("chunks_stored", 0)),
+                            total_latency_ms=total_latency_ms,
+                        )
+                    except httpx.TimeoutException as exc:
+                        last_exc = exc
+                        continue
+                    except Exception as exc:
+                        _mark_worker_degraded(worker_id, f"ingest_failed: {exc}")
+                        last_exc = exc
+                        continue
+
+        if last_exc:
+            raise httpx.HTTPError(f"all workers unavailable for ingest: {last_exc}")
+        raise httpx.HTTPError("all workers unavailable for ingest")
 
 
 @app.post("/query", response_model=QueryResponse)
 async def query(payload: QueryRequest) -> QueryResponse:
     start = time.perf_counter()
+    root_span = tracer.create_span("coordinator.query", None)
 
-    active_workers = [w for w in WORKERS if not _is_degraded(w)]
-    async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT_S) as client:
-        tasks = [
-            _post_json(
-                client,
-                worker_id,
-                "/query",
-                {"query": payload.query, "top_k": payload.top_k},
-                None,
-            )
-            for worker_id in active_workers
-        ]
-        responses = await asyncio.gather(*tasks, return_exceptions=True)
+    with tracer.span(root_span, {"top_k": payload.top_k}) as span_attrs:
+        active_workers = [w for w in WORKERS if not _is_degraded(w)]
+        span_attrs["workers_selected"] = active_workers
 
-    per_worker_latency: dict[str, float] = {}
-    merged: list[QueryResult] = []
+        async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT_S) as client:
+            tasks = []
+            task_workers = []
+            for worker_id in active_workers:
+                worker_span = tracer.create_span("coordinator.query.forward", TraceContext(root_span.trace_id, root_span.span_id))
+                trace_headers = tracer.inject_headers(worker_span)
+                tasks.append(_post_json(client, worker_id, "/query", {"query": payload.query, "top_k": payload.top_k}, trace_headers))
+                task_workers.append((worker_id, worker_span))
+            responses = await asyncio.gather(*tasks, return_exceptions=True)
 
-    for worker_id, result in zip(active_workers, responses):
-        if isinstance(result, httpx.TimeoutException):
-            per_worker_latency[worker_id] = -1.0
-            _mark_worker_degraded(worker_id, f"query_timeout: {result}")
-            logger.error(
-                f"Query scatter failure worker_id={worker_id} reason={result}",
-                extra={"request_id": worker_id},
-            )
-            continue
-        if isinstance(result, Exception):
-            per_worker_latency[worker_id] = -1.0
-            _mark_worker_degraded(worker_id, f"query_failed: {result}")
-            logger.error(
-                f"Query scatter failure worker_id={worker_id} reason={result}",
-                extra={"request_id": worker_id},
-            )
-            continue
+        per_worker_latency: dict[str, float] = {}
+        merged: list[QueryResult] = []
 
-        data, latency_ms = result
-        per_worker_latency[worker_id] = latency_ms
-        for item in data.get("results", []):
-            merged.append(
-                QueryResult(
-                    text=item.get("text", ""),
-                    score=float(item.get("score", 0.0)),
-                    metadata=item.get("metadata", {}) or {},
-                )
-            )
+        for (worker_id, worker_span), result in zip(task_workers, responses):
+            with tracer.span(worker_span, {"worker_id": worker_id}) as child_attrs:
+                if isinstance(result, httpx.TimeoutException):
+                    per_worker_latency[worker_id] = -1.0
+                    _mark_worker_degraded(worker_id, f"query_timeout: {result}")
+                    logger.error(f"Query scatter failure worker_id={worker_id} reason={result}", extra={"request_id": worker_id})
+                    child_attrs["error"] = str(result)
+                    continue
+                if isinstance(result, Exception):
+                    per_worker_latency[worker_id] = -1.0
+                    _mark_worker_degraded(worker_id, f"query_failed: {result}")
+                    logger.error(f"Query scatter failure worker_id={worker_id} reason={result}", extra={"request_id": worker_id})
+                    child_attrs["error"] = str(result)
+                    continue
 
-    merged.sort(key=lambda x: x.score, reverse=True)
-    top_results = merged[: payload.top_k]
+                data, latency_ms = result
+                per_worker_latency[worker_id] = latency_ms
+                child_attrs["latency_ms"] = latency_ms
+                for item in data.get("results", []):
+                    merged.append(QueryResult(text=item.get("text", ""), score=float(item.get("score", 0.0)), metadata=item.get("metadata", {}) or {}))
 
-    total_latency_ms = (time.perf_counter() - start) * 1000.0
-    return QueryResponse(
-        results=top_results,
-        per_worker_latency=per_worker_latency,
-        total_latency_ms=total_latency_ms,
-    )
+        merged.sort(key=lambda x: x.score, reverse=True)
+        top_results = merged[: payload.top_k]
+        total_latency_ms = (time.perf_counter() - start) * 1000.0
+        span_attrs["total_latency_ms"] = total_latency_ms
+
+        return QueryResponse(results=top_results, per_worker_latency=per_worker_latency, total_latency_ms=total_latency_ms)
 
 
 @app.post("/ingest/batch", response_model=BatchIngestResponse)
@@ -299,7 +303,7 @@ async def ingest_batch(payload: BatchIngestRequest) -> BatchIngestResponse:
         for doc in payload.documents:
             worker_id = ring.get_node(doc.document_id)
             worker_by_doc[doc.document_id] = worker_id
-            tasks.append(_post_json(client, worker_id, "/ingest", doc.model_dump(), None))
+            tasks.append(_post_json(client, worker_id, "/ingest", doc.model_dump(), {}))
 
         responses = await asyncio.gather(*tasks, return_exceptions=True)
 
@@ -311,14 +315,7 @@ async def ingest_batch(payload: BatchIngestRequest) -> BatchIngestResponse:
         if isinstance(result, Exception):
             if isinstance(result, httpx.TimeoutException):
                 _mark_worker_degraded(worker_id, f"batch_ingest_timeout: {result}")
-            results.append(
-                BatchDocumentStatus(
-                    document_id=doc.document_id,
-                    worker_id=worker_id,
-                    status="failed",
-                    error=str(result),
-                )
-            )
+            results.append(BatchDocumentStatus(document_id=doc.document_id, worker_id=worker_id, status="failed", error=str(result)))
             continue
 
         data, latency_ms = result
@@ -350,12 +347,7 @@ async def cluster_status() -> ClusterStatusResponse:
 
     for worker_id, result in zip(WORKERS, responses):
         if isinstance(result, Exception):
-            workers[worker_id] = WorkerHealth(
-                status="unreachable",
-                worker_id=worker_id,
-                degraded=True,
-                error=str(result),
-            )
+            workers[worker_id] = WorkerHealth(status="unreachable", worker_id=worker_id, degraded=True, error=str(result))
             continue
 
         try:
@@ -369,12 +361,7 @@ async def cluster_status() -> ClusterStatusResponse:
                 degraded=_is_degraded(worker_id),
             )
         except Exception as exc:
-            workers[worker_id] = WorkerHealth(
-                status="error",
-                worker_id=worker_id,
-                degraded=True,
-                error=str(exc),
-            )
+            workers[worker_id] = WorkerHealth(status="error", worker_id=worker_id, degraded=True, error=str(exc))
 
     return ClusterStatusResponse(workers=workers)
 
@@ -384,3 +371,9 @@ def failover_log() -> FailoverLogResponse:
     raw = redis_client.lrange(FAILOVER_LOG_KEY, 0, 99)
     failures = [FailoverEvent(**json.loads(item)) for item in raw]
     return FailoverLogResponse(failures=failures)
+
+
+@app.get("/traces", response_model=TraceListResponse)
+def traces() -> TraceListResponse:
+    items = tracer.fetch_recent_traces(limit=100)
+    return TraceListResponse(traces=items)
