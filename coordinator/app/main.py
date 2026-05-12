@@ -1,6 +1,8 @@
 import asyncio
+import json
 import os
 import time
+from contextlib import suppress
 from typing import Any
 
 import httpx
@@ -19,8 +21,14 @@ WORKERS = [w.strip() for w in os.getenv("WORKERS", "worker1,worker2,worker3").sp
 WORKER_PORT = int(os.getenv("WORKER_PORT", "8000"))
 REQUEST_TIMEOUT_S = float(os.getenv("REQUEST_TIMEOUT_S", "30"))
 
+DEGRADED_WORKERS_KEY = "cluster:degraded_workers"
+FAILOVER_LOG_KEY = "cluster:failover_log"
+FAILOVER_LOG_LIMIT = 200
+
 redis_client = redis.Redis(host=REDIS_HOST, port=REDIS_PORT, decode_responses=True)
 ring = ConsistentHashRing(nodes=WORKERS, vnodes=150)
+
+_health_monitor_task: asyncio.Task | None = None
 
 
 class IngestRequest(BaseModel):
@@ -83,8 +91,48 @@ class ClusterStatusResponse(BaseModel):
     workers: dict[str, WorkerHealth]
 
 
+class FailoverEvent(BaseModel):
+    ts_ms: float
+    worker_id: str
+    reason: str
+    action: str
+
+
+class FailoverLogResponse(BaseModel):
+    failures: list[FailoverEvent]
+
+
 def _worker_url(worker_id: str, path: str) -> str:
     return f"http://{worker_id}:{WORKER_PORT}{path}"
+
+
+def _log_failover(worker_id: str, reason: str, action: str) -> None:
+    event = {
+        "ts_ms": time.time() * 1000.0,
+        "worker_id": worker_id,
+        "reason": reason,
+        "action": action,
+    }
+    redis_client.lpush(FAILOVER_LOG_KEY, json.dumps(event))
+    redis_client.ltrim(FAILOVER_LOG_KEY, 0, FAILOVER_LOG_LIMIT - 1)
+    logger.error(
+        f"Failover event action={action} worker_id={worker_id} reason={reason}",
+        extra={"request_id": worker_id},
+    )
+
+
+def _mark_worker_degraded(worker_id: str, reason: str) -> None:
+    redis_client.sadd(DEGRADED_WORKERS_KEY, worker_id)
+    _log_failover(worker_id, reason, "degraded")
+
+
+def _recover_worker(worker_id: str, reason: str) -> None:
+    if redis_client.srem(DEGRADED_WORKERS_KEY, worker_id):
+        _log_failover(worker_id, reason, "recovered")
+
+
+def _is_degraded(worker_id: str) -> bool:
+    return bool(redis_client.sismember(DEGRADED_WORKERS_KEY, worker_id))
 
 
 async def _post_json(
@@ -96,36 +144,94 @@ async def _post_json(
 ) -> tuple[dict[str, Any], float]:
     headers = {"traceparent": traceparent} if traceparent else {}
     start = time.perf_counter()
-    resp = await client.post(_worker_url(worker_id, path), json=payload, headers=headers)
-    elapsed_ms = (time.perf_counter() - start) * 1000.0
-    resp.raise_for_status()
-    return resp.json(), elapsed_ms
+    try:
+        resp = await client.post(_worker_url(worker_id, path), json=payload, headers=headers)
+        elapsed_ms = (time.perf_counter() - start) * 1000.0
+        resp.raise_for_status()
+        return resp.json(), elapsed_ms
+    except httpx.TimeoutException as exc:
+        _mark_worker_degraded(worker_id, f"timeout {path}: {exc}")
+        raise
+
+
+async def _get_json(client: httpx.AsyncClient, worker_id: str, path: str) -> dict[str, Any]:
+    try:
+        resp = await client.get(_worker_url(worker_id, path))
+        resp.raise_for_status()
+        return resp.json()
+    except httpx.TimeoutException as exc:
+        _mark_worker_degraded(worker_id, f"timeout {path}: {exc}")
+        raise
+
+
+async def _health_monitor_loop() -> None:
+    while True:
+        async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT_S) as client:
+            tasks = [_get_json(client, worker_id, "/health") for worker_id in WORKERS]
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+
+        for worker_id, result in zip(WORKERS, results):
+            if isinstance(result, Exception):
+                _mark_worker_degraded(worker_id, f"health_check_failed: {result}")
+                continue
+            _recover_worker(worker_id, "health_check_ok")
+
+        await asyncio.sleep(30)
+
+
+@app.on_event("startup")
+async def startup_event() -> None:
+    global _health_monitor_task
+    _health_monitor_task = asyncio.create_task(_health_monitor_loop())
+
+
+@app.on_event("shutdown")
+async def shutdown_event() -> None:
+    global _health_monitor_task
+    if _health_monitor_task is not None:
+        _health_monitor_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await _health_monitor_task
 
 
 @app.post("/ingest", response_model=IngestResponse)
 async def ingest(payload: IngestRequest) -> IngestResponse:
     start = time.perf_counter()
-    worker_id = ring.get_node(payload.document_id)
+    candidates = ring.get_nodes(payload.document_id, len(WORKERS))
 
     async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT_S) as client:
-        worker_data, _ = await _post_json(client, worker_id, "/ingest", payload.model_dump(), None)
+        last_exc: Exception | None = None
+        for worker_id in candidates:
+            if _is_degraded(worker_id):
+                continue
+            try:
+                worker_data, _ = await _post_json(client, worker_id, "/ingest", payload.model_dump(), None)
+                await asyncio.to_thread(redis_client.set, payload.document_id, worker_id)
+                total_latency_ms = (time.perf_counter() - start) * 1000.0
+                logger.info("Ingest routed", extra={"request_id": payload.document_id})
+                return IngestResponse(
+                    worker_id=worker_id,
+                    chunks_stored=int(worker_data.get("chunks_stored", 0)),
+                    total_latency_ms=total_latency_ms,
+                )
+            except httpx.TimeoutException as exc:
+                last_exc = exc
+                continue
+            except Exception as exc:
+                _mark_worker_degraded(worker_id, f"ingest_failed: {exc}")
+                last_exc = exc
+                continue
 
-    await asyncio.to_thread(redis_client.set, payload.document_id, worker_id)
-
-    total_latency_ms = (time.perf_counter() - start) * 1000.0
-    logger.info("Ingest routed", extra={"request_id": payload.document_id})
-
-    return IngestResponse(
-        worker_id=worker_id,
-        chunks_stored=int(worker_data.get("chunks_stored", 0)),
-        total_latency_ms=total_latency_ms,
-    )
+    if last_exc:
+        raise httpx.HTTPError(f"all workers unavailable for ingest: {last_exc}")
+    raise httpx.HTTPError("all workers unavailable for ingest")
 
 
 @app.post("/query", response_model=QueryResponse)
 async def query(payload: QueryRequest) -> QueryResponse:
     start = time.perf_counter()
 
+    active_workers = [w for w in WORKERS if not _is_degraded(w)]
     async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT_S) as client:
         tasks = [
             _post_json(
@@ -135,16 +241,29 @@ async def query(payload: QueryRequest) -> QueryResponse:
                 {"query": payload.query, "top_k": payload.top_k},
                 None,
             )
-            for worker_id in WORKERS
+            for worker_id in active_workers
         ]
         responses = await asyncio.gather(*tasks, return_exceptions=True)
 
     per_worker_latency: dict[str, float] = {}
     merged: list[QueryResult] = []
 
-    for worker_id, result in zip(WORKERS, responses):
+    for worker_id, result in zip(active_workers, responses):
+        if isinstance(result, httpx.TimeoutException):
+            per_worker_latency[worker_id] = -1.0
+            _mark_worker_degraded(worker_id, f"query_timeout: {result}")
+            logger.error(
+                f"Query scatter failure worker_id={worker_id} reason={result}",
+                extra={"request_id": worker_id},
+            )
+            continue
         if isinstance(result, Exception):
             per_worker_latency[worker_id] = -1.0
+            _mark_worker_degraded(worker_id, f"query_failed: {result}")
+            logger.error(
+                f"Query scatter failure worker_id={worker_id} reason={result}",
+                extra={"request_id": worker_id},
+            )
             continue
 
         data, latency_ms = result
@@ -190,6 +309,8 @@ async def ingest_batch(payload: BatchIngestRequest) -> BatchIngestResponse:
     for doc, result in zip(payload.documents, responses):
         worker_id = worker_by_doc[doc.document_id]
         if isinstance(result, Exception):
+            if isinstance(result, httpx.TimeoutException):
+                _mark_worker_degraded(worker_id, f"batch_ingest_timeout: {result}")
             results.append(
                 BatchDocumentStatus(
                     document_id=doc.document_id,
@@ -245,7 +366,7 @@ async def cluster_status() -> ClusterStatusResponse:
                 worker_id=str(data.get("worker_id", worker_id)),
                 documents_indexed=int(data.get("documents_indexed", 0)),
                 memory_usage_mb=float(data.get("memory_usage_mb", 0.0)),
-                degraded=False,
+                degraded=_is_degraded(worker_id),
             )
         except Exception as exc:
             workers[worker_id] = WorkerHealth(
@@ -256,3 +377,10 @@ async def cluster_status() -> ClusterStatusResponse:
             )
 
     return ClusterStatusResponse(workers=workers)
+
+
+@app.get("/cluster/failover-log", response_model=FailoverLogResponse)
+def failover_log() -> FailoverLogResponse:
+    raw = redis_client.lrange(FAILOVER_LOG_KEY, 0, 99)
+    failures = [FailoverEvent(**json.loads(item)) for item in raw]
+    return FailoverLogResponse(failures=failures)
