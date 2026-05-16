@@ -19,7 +19,8 @@ CHROMA_HOST = os.getenv("CHROMA_HOST", "chromadb")
 CHROMA_PORT = int(os.getenv("CHROMA_PORT", "8000"))
 
 chroma = HttpClient(host=CHROMA_HOST, port=CHROMA_PORT)
-collection = chroma.get_or_create_collection(name=WORKER_ID)
+CHROMA_COLLECTION = os.getenv("CHROMA_COLLECTION", WORKER_ID)
+collection = chroma.get_or_create_collection(name=CHROMA_COLLECTION)
 model = SentenceTransformer(MODEL_NAME)
 tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
 tracer = init_tracer(service_name=WORKER_ID)
@@ -180,3 +181,4 @@ def health(
         memory_usage_mb = psutil.Process(os.getpid()).memory_info().rss / (1024 * 1024)
 
     return HealthResponse(worker_id=WORKER_ID, documents_indexed=documents_indexed, memory_usage_mb=round(memory_usage_mb, 2))
+
