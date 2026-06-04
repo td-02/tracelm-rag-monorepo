@@ -3,6 +3,7 @@ import json
 import os
 import time
 from contextlib import suppress
+from hashlib import sha256
 from typing import Any
 
 import httpx
@@ -21,10 +22,15 @@ REDIS_PORT = int(os.getenv("REDIS_PORT", "6379"))
 WORKERS = [w.strip() for w in os.getenv("WORKERS", "worker1,worker2,worker3").split(",") if w.strip()]
 WORKER_PORT = int(os.getenv("WORKER_PORT", "8000"))
 REQUEST_TIMEOUT_S = float(os.getenv("REQUEST_TIMEOUT_S", "30"))
+QUERY_CACHE_TTL_S = int(os.getenv("QUERY_CACHE_TTL_S", "60"))
 
 DEGRADED_WORKERS_KEY = "cluster:degraded_workers"
 FAILOVER_LOG_KEY = "cluster:failover_log"
 FAILOVER_LOG_LIMIT = 200
+QUERY_CACHE_PREFIX = "query_cache:"
+QUERY_CACHE_VERSION_KEY = "query_cache:version"
+QUERY_CACHE_HITS_KEY = "query_cache:hits"
+QUERY_CACHE_MISSES_KEY = "query_cache:misses"
 
 redis_client = redis.Redis(host=REDIS_HOST, port=REDIS_PORT, decode_responses=True)
 ring = ConsistentHashRing(nodes=WORKERS, vnodes=150)
@@ -59,6 +65,7 @@ class QueryResponse(BaseModel):
     results: list[QueryResult]
     per_worker_latency: dict[str, float]
     total_latency_ms: float
+    cache_hit: bool = False
 
 
 class BatchIngestRequest(BaseModel):
@@ -107,8 +114,55 @@ class TraceListResponse(BaseModel):
     traces: list[dict[str, Any]]
 
 
+class CacheStatsResponse(BaseModel):
+    enabled: bool
+    ttl_seconds: int
+    version: int
+    hits: int
+    misses: int
+
+
 def _worker_url(worker_id: str, path: str) -> str:
     return f"http://{worker_id}:{WORKER_PORT}{path}"
+
+
+def _get_cache_version() -> int:
+    raw = redis_client.get(QUERY_CACHE_VERSION_KEY)
+    if raw is None:
+        redis_client.set(QUERY_CACHE_VERSION_KEY, 1)
+        return 1
+    return int(raw)
+
+
+def _bump_cache_version() -> int:
+    return int(redis_client.incr(QUERY_CACHE_VERSION_KEY))
+
+
+def _query_cache_key(query: str, top_k: int) -> str:
+    version = _get_cache_version()
+    digest = sha256(f"{query}:{top_k}".encode("utf-8")).hexdigest()
+    return f"{QUERY_CACHE_PREFIX}v{version}:{digest}"
+
+
+def _load_cached_query(query: str, top_k: int) -> QueryResponse | None:
+    if QUERY_CACHE_TTL_S <= 0:
+        return None
+
+    raw = redis_client.get(_query_cache_key(query, top_k))
+    if not raw:
+        redis_client.incr(QUERY_CACHE_MISSES_KEY)
+        return None
+
+    redis_client.incr(QUERY_CACHE_HITS_KEY)
+    return QueryResponse(**json.loads(raw))
+
+
+def _store_cached_query(query: str, top_k: int, response: QueryResponse) -> None:
+    if QUERY_CACHE_TTL_S <= 0:
+        return
+
+    payload = response.model_copy(update={"cache_hit": True}).model_dump()
+    redis_client.setex(_query_cache_key(query, top_k), QUERY_CACHE_TTL_S, json.dumps(payload))
 
 
 def _log_failover(worker_id: str, reason: str, action: str) -> None:
@@ -219,6 +273,7 @@ async def ingest(payload: IngestRequest) -> IngestResponse:
                         trace_headers = tracer.inject_headers(child_span)
                         worker_data, _ = await _post_json(client, worker_id, "/ingest", payload.model_dump(), trace_headers)
                         await asyncio.to_thread(redis_client.set, payload.document_id, worker_id)
+                        await asyncio.to_thread(_bump_cache_version)
                         total_latency_ms = (time.perf_counter() - start) * 1000.0
                         span_attrs["worker_selected"] = worker_id
                         span_attrs["routing_decision"] = f"hash->{worker_id}"
@@ -247,6 +302,14 @@ async def query(payload: QueryRequest) -> QueryResponse:
     root_span = tracer.create_span("coordinator.query", None)
 
     with tracer.span(root_span, {"top_k": payload.top_k}) as span_attrs:
+        cached = await asyncio.to_thread(_load_cached_query, payload.query, payload.top_k)
+        if cached is not None:
+            total_latency_ms = (time.perf_counter() - start) * 1000.0
+            span_attrs["cache_hit"] = True
+            span_attrs["total_latency_ms"] = total_latency_ms
+            return cached.model_copy(update={"total_latency_ms": total_latency_ms, "cache_hit": True})
+
+        span_attrs["cache_hit"] = False
         active_workers = [w for w in WORKERS if not _is_degraded(w)]
         span_attrs["workers_selected"] = active_workers
 
@@ -288,8 +351,14 @@ async def query(payload: QueryRequest) -> QueryResponse:
         top_results = merged[: payload.top_k]
         total_latency_ms = (time.perf_counter() - start) * 1000.0
         span_attrs["total_latency_ms"] = total_latency_ms
-
-        return QueryResponse(results=top_results, per_worker_latency=per_worker_latency, total_latency_ms=total_latency_ms)
+        response = QueryResponse(
+            results=top_results,
+            per_worker_latency=per_worker_latency,
+            total_latency_ms=total_latency_ms,
+            cache_hit=False,
+        )
+        await asyncio.to_thread(_store_cached_query, payload.query, payload.top_k, response)
+        return response
 
 
 @app.post("/ingest/batch", response_model=BatchIngestResponse)
@@ -332,6 +401,7 @@ async def ingest_batch(payload: BatchIngestRequest) -> BatchIngestResponse:
 
     if redis_sets:
         await asyncio.gather(*redis_sets)
+    await asyncio.to_thread(_bump_cache_version)
 
     total_latency_ms = (time.perf_counter() - start) * 1000.0
     return BatchIngestResponse(results=results, total_latency_ms=total_latency_ms)
@@ -377,3 +447,14 @@ def failover_log() -> FailoverLogResponse:
 def traces() -> TraceListResponse:
     items = tracer.fetch_recent_traces(limit=100)
     return TraceListResponse(traces=items)
+
+
+@app.get("/cache/stats", response_model=CacheStatsResponse)
+def cache_stats() -> CacheStatsResponse:
+    return CacheStatsResponse(
+        enabled=QUERY_CACHE_TTL_S > 0,
+        ttl_seconds=QUERY_CACHE_TTL_S,
+        version=_get_cache_version(),
+        hits=int(redis_client.get(QUERY_CACHE_HITS_KEY) or 0),
+        misses=int(redis_client.get(QUERY_CACHE_MISSES_KEY) or 0),
+    )

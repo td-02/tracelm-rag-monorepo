@@ -11,6 +11,7 @@ import streamlit as st
 COORDINATOR_BASE = "http://localhost:8000"
 CLUSTER_STATUS_URL = f"{COORDINATOR_BASE}/cluster/status"
 TRACES_URL = f"{COORDINATOR_BASE}/traces"
+CACHE_STATS_URL = f"{COORDINATOR_BASE}/cache/stats"
 BENCHMARK_PATH = Path("benchmark_results.json")
 
 st.set_page_config(page_title="RAG Cluster Dashboard", layout="wide")
@@ -28,6 +29,14 @@ def fetch_cluster_status() -> dict[str, Any]:
 def fetch_traces() -> dict[str, Any]:
     with httpx.Client(timeout=15.0) as client:
         resp = client.get(TRACES_URL)
+        resp.raise_for_status()
+        return resp.json()
+
+
+@st.cache_data(ttl=5)
+def fetch_cache_stats() -> dict[str, Any]:
+    with httpx.Client(timeout=10.0) as client:
+        resp = client.get(CACHE_STATS_URL)
         resp.raise_for_status()
         return resp.json()
 
@@ -74,6 +83,16 @@ def render_cluster_overview() -> None:
     )
     fig_docs = px.bar(docs_df, x="worker_id", y="documents_indexed", title="Documents Per Worker")
     st.plotly_chart(fig_docs, use_container_width=True)
+
+    try:
+        cache_stats = fetch_cache_stats()
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Query Cache", "enabled" if cache_stats.get("enabled") else "disabled")
+        c2.metric("Cache Hits", int(cache_stats.get("hits", 0)))
+        c3.metric("Cache Misses", int(cache_stats.get("misses", 0)))
+        c4.metric("Cache TTL", f"{int(cache_stats.get('ttl_seconds', 0))}s")
+    except Exception as exc:
+        st.info(f"Cache stats unavailable: {exc}")
 
     st.subheader("Memory Usage Per Worker")
     gauge_cols = st.columns(len(workers))
