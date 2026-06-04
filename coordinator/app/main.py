@@ -53,6 +53,7 @@ class IngestResponse(BaseModel):
 class QueryRequest(BaseModel):
     query: str = Field(..., min_length=1)
     top_k: int = Field(default=5, ge=1, le=100)
+    use_cache: bool = True
 
 
 class QueryResult(BaseModel):
@@ -120,6 +121,11 @@ class CacheStatsResponse(BaseModel):
     version: int
     hits: int
     misses: int
+
+
+class CacheInvalidateResponse(BaseModel):
+    invalidated: bool
+    version: int
 
 
 def _worker_url(worker_id: str, path: str) -> str:
@@ -301,8 +307,10 @@ async def query(payload: QueryRequest) -> QueryResponse:
     start = time.perf_counter()
     root_span = tracer.create_span("coordinator.query", None)
 
-    with tracer.span(root_span, {"top_k": payload.top_k}) as span_attrs:
-        cached = await asyncio.to_thread(_load_cached_query, payload.query, payload.top_k)
+    with tracer.span(root_span, {"top_k": payload.top_k, "use_cache": payload.use_cache}) as span_attrs:
+        cached = None
+        if payload.use_cache:
+            cached = await asyncio.to_thread(_load_cached_query, payload.query, payload.top_k)
         if cached is not None:
             total_latency_ms = (time.perf_counter() - start) * 1000.0
             span_attrs["cache_hit"] = True
@@ -357,7 +365,8 @@ async def query(payload: QueryRequest) -> QueryResponse:
             total_latency_ms=total_latency_ms,
             cache_hit=False,
         )
-        await asyncio.to_thread(_store_cached_query, payload.query, payload.top_k, response)
+        if payload.use_cache:
+            await asyncio.to_thread(_store_cached_query, payload.query, payload.top_k, response)
         return response
 
 
@@ -457,4 +466,12 @@ def cache_stats() -> CacheStatsResponse:
         version=_get_cache_version(),
         hits=int(redis_client.get(QUERY_CACHE_HITS_KEY) or 0),
         misses=int(redis_client.get(QUERY_CACHE_MISSES_KEY) or 0),
+    )
+
+
+@app.post("/cache/invalidate", response_model=CacheInvalidateResponse)
+def invalidate_cache() -> CacheInvalidateResponse:
+    return CacheInvalidateResponse(
+        invalidated=True,
+        version=_bump_cache_version(),
     )

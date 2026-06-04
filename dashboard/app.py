@@ -12,6 +12,7 @@ COORDINATOR_BASE = "http://localhost:8000"
 CLUSTER_STATUS_URL = f"{COORDINATOR_BASE}/cluster/status"
 TRACES_URL = f"{COORDINATOR_BASE}/traces"
 CACHE_STATS_URL = f"{COORDINATOR_BASE}/cache/stats"
+CACHE_INVALIDATE_URL = f"{COORDINATOR_BASE}/cache/invalidate"
 BENCHMARK_PATH = Path("benchmark_results.json")
 
 st.set_page_config(page_title="RAG Cluster Dashboard", layout="wide")
@@ -37,6 +38,13 @@ def fetch_traces() -> dict[str, Any]:
 def fetch_cache_stats() -> dict[str, Any]:
     with httpx.Client(timeout=10.0) as client:
         resp = client.get(CACHE_STATS_URL)
+        resp.raise_for_status()
+        return resp.json()
+
+
+def invalidate_cache() -> dict[str, Any]:
+    with httpx.Client(timeout=10.0) as client:
+        resp = client.post(CACHE_INVALIDATE_URL)
         resp.raise_for_status()
         return resp.json()
 
@@ -69,8 +77,8 @@ def render_cluster_overview() -> None:
     status_cols = st.columns(len(workers))
     for idx, (worker_id, info) in enumerate(workers.items()):
         degraded = bool(info.get("degraded", True))
-        icon = "??" if degraded else "??"
-        status_cols[idx].metric(worker_id, f"{icon} {'degraded' if degraded else 'healthy'}")
+        label = "degraded" if degraded else "healthy"
+        status_cols[idx].metric(worker_id, label)
 
     docs_df = pd.DataFrame(
         [
@@ -91,6 +99,10 @@ def render_cluster_overview() -> None:
         c2.metric("Cache Hits", int(cache_stats.get("hits", 0)))
         c3.metric("Cache Misses", int(cache_stats.get("misses", 0)))
         c4.metric("Cache TTL", f"{int(cache_stats.get('ttl_seconds', 0))}s")
+        if st.button("Invalidate Cache", use_container_width=True):
+            result = invalidate_cache()
+            st.cache_data.clear()
+            st.success(f"Cache invalidated. New version: {result.get('version')}")
     except Exception as exc:
         st.info(f"Cache stats unavailable: {exc}")
 
