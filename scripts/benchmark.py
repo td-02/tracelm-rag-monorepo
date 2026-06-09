@@ -43,6 +43,17 @@ def synthetic_doc(i: int) -> dict[str, Any]:
     }
 
 
+def summarize_latencies(latencies: list[float]) -> dict[str, float]:
+    if not latencies:
+        return {"avg_ms": 0.0, "p50_ms": 0.0, "p95_ms": 0.0, "p99_ms": 0.0}
+    return {
+        "avg_ms": statistics.mean(latencies),
+        "p50_ms": percentile(latencies, 0.50),
+        "p95_ms": percentile(latencies, 0.95),
+        "p99_ms": percentile(latencies, 0.99),
+    }
+
+
 async def experiment_1_ingestion_speed(client: httpx.AsyncClient) -> dict[str, Any]:
     docs = [synthetic_doc(i) for i in range(1000)]
     worker_counts: Counter[str] = Counter()
@@ -59,6 +70,12 @@ async def experiment_1_ingestion_speed(client: httpx.AsyncClient) -> dict[str, A
         worker: (count / elapsed if elapsed > 0 else 0.0)
         for worker, count in worker_counts.items()
     }
+    expected = len(docs) / max(1, len(worker_counts))
+    shard_imbalance_pct = (
+        (max(worker_counts.values()) - min(worker_counts.values())) / expected * 100.0
+        if len(worker_counts) > 1
+        else 0.0
+    )
 
     return {
         "documents": len(docs),
@@ -66,6 +83,7 @@ async def experiment_1_ingestion_speed(client: httpx.AsyncClient) -> dict[str, A
         "overall_throughput_docs_per_s": len(docs) / elapsed if elapsed > 0 else 0.0,
         "per_worker_counts": dict(worker_counts),
         "per_worker_throughput_docs_per_s": per_worker_throughput,
+        "shard_imbalance_pct": shard_imbalance_pct,
     }
 
 
@@ -94,9 +112,7 @@ async def experiment_2_query_latency_under_load(client: httpx.AsyncClient) -> di
 
     return {
         "queries": 100,
-        "p50_ms": percentile(latencies, 0.50),
-        "p95_ms": percentile(latencies, 0.95),
-        "p99_ms": percentile(latencies, 0.99),
+        **summarize_latencies(latencies),
         "per_worker_latency_ms_avg": {
             worker: (sum(vals) / len(vals) if vals else 0.0)
             for worker, vals in per_worker_latency.items()
@@ -208,6 +224,8 @@ async def experiment_4_scatter_gather_overhead(client: httpx.AsyncClient) -> dic
         "rounds": rounds,
         "scatter_avg_ms": statistics.mean(scatter_latencies) if scatter_latencies else 0.0,
         "single_avg_ms": statistics.mean(single_latencies) if single_latencies else 0.0,
+        "scatter_p95_ms": percentile(scatter_latencies, 0.95) if scatter_latencies else 0.0,
+        "single_p95_ms": percentile(single_latencies, 0.95) if single_latencies else 0.0,
         "latency_difference_ms": (
             statistics.mean(scatter_latencies) - statistics.mean(single_latencies)
             if scatter_latencies and single_latencies
@@ -217,12 +235,53 @@ async def experiment_4_scatter_gather_overhead(client: httpx.AsyncClient) -> dic
     }
 
 
+async def experiment_5_query_cache_effectiveness(client: httpx.AsyncClient) -> dict[str, Any]:
+    query_text = "cache benchmark repeated query"
+    top_k = 5
+    uncached_latencies: list[float] = []
+    cached_latencies: list[float] = []
+    cache_hits = 0
+
+    for _ in range(20):
+        t0 = time.perf_counter()
+        resp = await client.post(
+            f"{COORDINATOR_URL}/query",
+            json={"query": query_text, "top_k": top_k, "use_cache": False},
+        )
+        resp.raise_for_status()
+        uncached_latencies.append((time.perf_counter() - t0) * 1000.0)
+
+    for _ in range(20):
+        t0 = time.perf_counter()
+        resp = await client.post(
+            f"{COORDINATOR_URL}/query",
+            json={"query": query_text, "top_k": top_k, "use_cache": True},
+        )
+        resp.raise_for_status()
+        payload = resp.json()
+        cached_latencies.append((time.perf_counter() - t0) * 1000.0)
+        if payload.get("cache_hit"):
+            cache_hits += 1
+
+    uncached_avg = statistics.mean(uncached_latencies) if uncached_latencies else 0.0
+    cached_avg = statistics.mean(cached_latencies) if cached_latencies else 0.0
+    speedup = (uncached_avg / cached_avg) if cached_avg > 0 else 0.0
+
+    return {
+        "uncached": summarize_latencies(uncached_latencies),
+        "cached": summarize_latencies(cached_latencies),
+        "cache_hits": cache_hits,
+        "cache_requests": len(cached_latencies),
+        "speedup_ratio": speedup,
+    }
+
+
 def print_table(results: dict[str, Any]) -> None:
     rows = [
         (
             "Exp1 Ingestion",
             f"time={results['experiment_1_ingestion_speed']['total_time_s']:.2f}s",
-            f"throughput={results['experiment_1_ingestion_speed']['overall_throughput_docs_per_s']:.2f} docs/s",
+            f"throughput={results['experiment_1_ingestion_speed']['overall_throughput_docs_per_s']:.2f} docs/s imbalance={results['experiment_1_ingestion_speed']['shard_imbalance_pct']:.1f}%",
         ),
         (
             "Exp2 Query Load",
@@ -238,6 +297,11 @@ def print_table(results: dict[str, Any]) -> None:
             "Exp4 Scatter Overhead",
             f"scatter={results['experiment_4_scatter_gather_overhead']['scatter_avg_ms']:.1f}ms single={results['experiment_4_scatter_gather_overhead']['single_avg_ms']:.1f}ms",
             f"quality_delta={results['experiment_4_scatter_gather_overhead']['quality_difference_ratio']:.3f}",
+        ),
+        (
+            "Exp5 Query Cache",
+            f"uncached={results['experiment_5_query_cache_effectiveness']['uncached']['avg_ms']:.1f}ms cached={results['experiment_5_query_cache_effectiveness']['cached']['avg_ms']:.1f}ms",
+            f"speedup={results['experiment_5_query_cache_effectiveness']['speedup_ratio']:.2f}x hits={results['experiment_5_query_cache_effectiveness']['cache_hits']}/{results['experiment_5_query_cache_effectiveness']['cache_requests']}",
         ),
     ]
 
@@ -258,6 +322,7 @@ async def main() -> None:
             "experiment_2_query_latency_under_load": await experiment_2_query_latency_under_load(client),
             "experiment_3_fault_tolerance": await experiment_3_fault_tolerance(client),
             "experiment_4_scatter_gather_overhead": await experiment_4_scatter_gather_overhead(client),
+            "experiment_5_query_cache_effectiveness": await experiment_5_query_cache_effectiveness(client),
             "generated_at_epoch": time.time(),
         }
 
