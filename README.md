@@ -98,11 +98,12 @@ python scripts/benchmark.py
 Produces:
 
 - `benchmark_results.json`
-- console summary table for 4 experiments:
+- console summary table for 5 experiments:
   - ingestion speed
   - query latency under load
   - fault tolerance under node failure
   - scatter-gather overhead
+  - query cache effectiveness
 
 ## Sample Benchmark Results (Placeholder)
 
@@ -112,6 +113,7 @@ Produces:
 | Query Latency Under Load | `P50=... ms`, `P95=... ms`, `P99=... ms` | 100 concurrent queries |
 | Fault Tolerance | `success_rate=...%`, `recovery_time_s=...` | worker_2 failure + restart |
 | Scatter-Gather Overhead | `delta_latency=... ms`, `quality_delta=...` | single shard vs all shards |
+| Query Cache Effectiveness | `cached_avg=... ms`, `speedup=...x` | repeated queries with cache on/off |
 
 ## Tech Stack
 
