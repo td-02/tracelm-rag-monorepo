@@ -238,12 +238,28 @@ def render_benchmark_results() -> None:
     exp2 = data.get("experiment_2_query_latency_under_load", {})
     exp3 = data.get("experiment_3_fault_tolerance", {})
     exp4 = data.get("experiment_4_scatter_gather_overhead", {})
+    exp5 = data.get("experiment_5_query_cache_effectiveness", {})
+
+    st.download_button(
+        "Download benchmark_results.json",
+        data=json.dumps(data, indent=2),
+        file_name="benchmark_results.json",
+        mime="application/json",
+        use_container_width=True,
+    )
+
+    summary_cols = st.columns(4)
+    summary_cols[0].metric("Ingestion Throughput", f"{float(exp1.get('overall_throughput_docs_per_s', 0.0)):.2f} docs/s")
+    summary_cols[1].metric("Shard Imbalance", f"{float(exp1.get('shard_imbalance_pct', 0.0)):.1f}%")
+    summary_cols[2].metric("Query P95", f"{float(exp2.get('p95_ms', 0.0)):.1f} ms")
+    summary_cols[3].metric("Cache Speedup", f"{float(exp5.get('speedup_ratio', 0.0)):.2f}x")
 
     st.subheader("Latency Percentiles")
     latency_df = pd.DataFrame(
         {
-            "percentile": ["P50", "P95", "P99"],
+            "percentile": ["AVG", "P50", "P95", "P99"],
             "latency_ms": [
+                float(exp2.get("avg_ms", 0.0)),
                 float(exp2.get("p50_ms", 0.0)),
                 float(exp2.get("p95_ms", 0.0)),
                 float(exp2.get("p99_ms", 0.0)),
@@ -264,6 +280,21 @@ def render_benchmark_results() -> None:
     else:
         st.info("No throughput data available.")
 
+    st.subheader("Query Cache Effectiveness")
+    cache_df = pd.DataFrame(
+        [
+            {"mode": "Uncached", "avg_ms": float(exp5.get("uncached", {}).get("avg_ms", 0.0))},
+            {"mode": "Cached", "avg_ms": float(exp5.get("cached", {}).get("avg_ms", 0.0))},
+        ]
+    )
+    fig_cache = px.bar(cache_df, x="mode", y="avg_ms", title="Repeated Query Latency: Cache Off vs On")
+    st.plotly_chart(fig_cache, use_container_width=True)
+
+    cache_cols = st.columns(3)
+    cache_cols[0].metric("Cache Hits", f"{int(exp5.get('cache_hits', 0))}/{int(exp5.get('cache_requests', 0))}")
+    cache_cols[1].metric("Cached P95", f"{float(exp5.get('cached', {}).get('p95_ms', 0.0)):.1f} ms")
+    cache_cols[2].metric("Uncached P95", f"{float(exp5.get('uncached', {}).get('p95_ms', 0.0)):.1f} ms")
+
     st.subheader("Fault Tolerance Timeline")
     baseline = float(exp3.get("baseline_latency_ms", 0.0))
     spike = float(exp3.get("failover_window_latency_ms", 0.0))
@@ -277,6 +308,24 @@ def render_benchmark_results() -> None:
     )
     fig_ft = px.line(timeline_df, x="phase", y="latency_ms", markers=True, title="Fault Tolerance Latency Timeline")
     st.plotly_chart(fig_ft, use_container_width=True)
+
+    st.subheader("Scatter vs Single Worker")
+    compare_df = pd.DataFrame(
+        [
+            {
+                "mode": "Scatter-gather",
+                "avg_ms": float(exp4.get("scatter_avg_ms", 0.0)),
+                "p95_ms": float(exp4.get("scatter_p95_ms", 0.0)),
+            },
+            {
+                "mode": "Single worker",
+                "avg_ms": float(exp4.get("single_avg_ms", 0.0)),
+                "p95_ms": float(exp4.get("single_p95_ms", 0.0)),
+            },
+        ]
+    )
+    fig_compare = px.bar(compare_df, x="mode", y=["avg_ms", "p95_ms"], barmode="group", title="Scatter-Gather Overhead")
+    st.plotly_chart(fig_compare, use_container_width=True)
 
     col1, col2, col3 = st.columns(3)
     col1.metric("Success Rate", f"{float(exp3.get('success_rate', 0.0))*100:.1f}%")
