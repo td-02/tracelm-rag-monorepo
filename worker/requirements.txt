@@ -2,7 +2,5 @@ fastapi==0.115.5
 uvicorn[standard]==0.32.0
 chromadb==0.5.20
 pydantic==2.10.1
-sentence-transformers==3.3.1
-transformers==4.46.3
 psutil==6.1.0
 tracelm==0.4.4

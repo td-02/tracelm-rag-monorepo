@@ -1,0 +1,66 @@
+{
+  "experiment_1_ingestion_speed": {
+    "documents": 1000,
+    "total_time_s": 10.484584708006878,
+    "overall_throughput_docs_per_s": 95.37812205726365,
+    "per_worker_counts": {
+      "worker_1": 340,
+      "worker_3": 363,
+      "worker_2": 297
+    },
+    "per_worker_throughput_docs_per_s": {
+      "worker_1": 32.428561499469645,
+      "worker_3": 34.622258306786705,
+      "worker_2": 28.327302251007303
+    },
+    "shard_imbalance_pct": 19.8
+  },
+  "experiment_2_query_latency_under_load": {
+    "queries": 100,
+    "avg_ms": 1194.5535649894737,
+    "p50_ms": 1303.6125209982856,
+    "p95_ms": 1602.218943455955,
+    "p99_ms": 1614.531283930701,
+    "per_worker_latency_ms_avg": {
+      "worker_1": 840.7716087699873,
+      "worker_2": 821.3871804199653,
+      "worker_3": 835.3864253900383
+    }
+  },
+  "experiment_3_fault_tolerance": {
+    "queries": 100,
+    "success_rate": 1.0,
+    "baseline_latency_ms": 333.4350469507626,
+    "failover_window_latency_ms": 258.9205291500548,
+    "latency_spike_ms": -74.51451780070784,
+    "recovery_time_s": 1.0813930000003893,
+    "recovered": true
+  },
+  "experiment_4_scatter_gather_overhead": {
+    "rounds": 30,
+    "scatter_avg_ms": 5.312199899344705,
+    "single_avg_ms": 7.499695865893348,
+    "scatter_p95_ms": 10.337716146386786,
+    "single_p95_ms": 10.643612648709672,
+    "latency_difference_ms": -2.187495966548643,
+    "quality_difference_ratio": 0.2
+  },
+  "experiment_5_query_cache_effectiveness": {
+    "uncached": {
+      "avg_ms": 13.779102050102665,
+      "p50_ms": 13.441666498692939,
+      "p95_ms": 16.115109799648053,
+      "p99_ms": 17.174455561253122
+    },
+    "cached": {
+      "avg_ms": 4.0497208006854635,
+      "p50_ms": 3.2584165019216016,
+      "p95_ms": 5.861074999484124,
+      "p99_ms": 13.106915002790616
+    },
+    "cache_hits": 19,
+    "cache_requests": 20,
+    "speedup_ratio": 3.402481980429463
+  },
+  "generated_at_epoch": 1786046677.694348
+}

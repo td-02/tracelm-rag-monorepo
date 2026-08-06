@@ -1,6 +1,6 @@
 from collections import Counter
 
-from shared.shared.hashing import ConsistentHashRing
+from shared import ConsistentHashRing
 
 
 def _coefficient_of_variation(counts: Counter[str], nodes: list[str]) -> float:

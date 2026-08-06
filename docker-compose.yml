@@ -131,7 +131,7 @@ services:
       - rag_network
 
   chromadb:
-    image: chromadb/chroma
+    image: chromadb/chroma:0.5.20
     ports:
       - "8004:8000"
     volumes:
