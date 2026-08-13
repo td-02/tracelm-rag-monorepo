@@ -1,7 +1,9 @@
-import os
-import time
+import functools
 import hashlib
+import os
 import re
+import threading
+import time
 from typing import Any
 
 import psutil
@@ -18,14 +20,47 @@ CHROMA_HOST = os.getenv("CHROMA_HOST", "chromadb")
 CHROMA_PORT = int(os.getenv("CHROMA_PORT", "8000"))
 EMBED_DIMENSION = int(os.getenv("EMBED_DIMENSION", "384"))
 
-chroma = HttpClient(host=CHROMA_HOST, port=CHROMA_PORT)
 CHROMA_COLLECTION = os.getenv("CHROMA_COLLECTION", WORKER_ID)
-collection = chroma.get_or_create_collection(name=CHROMA_COLLECTION)
 tracer = init_tracer(service_name=WORKER_ID)
+_collection_lock = threading.Lock()
+_collection = None
+_documents_indexed = 0
+_collection_init_attempts = 5
+
+
+def _get_collection():
+    global _collection
+    if _collection is not None:
+        return _collection
+
+    with _collection_lock:
+        if _collection is None:
+            last_exc: Exception | None = None
+            for attempt in range(_collection_init_attempts):
+                try:
+                    chroma = HttpClient(host=CHROMA_HOST, port=CHROMA_PORT)
+                    _collection = chroma.get_or_create_collection(name=CHROMA_COLLECTION)
+                    break
+                except Exception as exc:
+                    last_exc = exc
+                    if attempt + 1 < _collection_init_attempts:
+                        time.sleep(1.0)
+            if _collection is None:
+                assert last_exc is not None
+                raise last_exc
+    return _collection
 
 
 def _tokenize(text: str) -> list[str]:
     return re.findall(r"[a-z0-9]+", text.lower())
+
+
+@functools.lru_cache(maxsize=8192)
+def _token_hash_index_sign(token: str) -> tuple[int, float]:
+    digest = hashlib.sha256(token.encode("utf-8")).digest()
+    index = int.from_bytes(digest[:4], "big") % EMBED_DIMENSION
+    sign = 1.0 if digest[4] % 2 == 0 else -1.0
+    return index, sign
 
 
 def _embed_text(text: str) -> list[float]:
@@ -35,9 +70,7 @@ def _embed_text(text: str) -> list[float]:
         return vector
 
     for token in tokens:
-        digest = hashlib.sha256(token.encode("utf-8")).digest()
-        index = int.from_bytes(digest[:4], "big") % EMBED_DIMENSION
-        sign = 1.0 if digest[4] % 2 == 0 else -1.0
+        index, sign = _token_hash_index_sign(token)
         vector[index] += sign
 
     norm = sum(value * value for value in vector) ** 0.5
@@ -140,8 +173,10 @@ def ingest(
             db_span = tracer.create_span("worker.ingest.chroma_write", TraceContext(root_span.trace_id, root_span.span_id))
             db_t0 = time.perf_counter()
             with tracer.span(db_span) as attrs:
-                collection.upsert(ids=ids, embeddings=embeddings, documents=chunks, metadatas=metadatas)
+                _get_collection().upsert(ids=ids, embeddings=embeddings, documents=chunks, metadatas=metadatas)
                 attrs["rows_upserted"] = len(ids)
+            global _documents_indexed
+            _documents_indexed += len(ids)
             root_attrs["db_latency_ms"] = (time.perf_counter() - db_t0) * 1000.0
 
         root_attrs["chunk_count"] = len(chunks)
@@ -171,7 +206,7 @@ def query(
         db_span = tracer.create_span("worker.query.chroma_read", TraceContext(root_span.trace_id, root_span.span_id))
         db_t0 = time.perf_counter()
         with tracer.span(db_span):
-            found = collection.query(
+            found = _get_collection().query(
                 query_embeddings=[query_embedding],
                 n_results=payload.top_k,
                 include=["documents", "metadatas", "distances"],
@@ -201,7 +236,7 @@ def health(
     response.headers.update(tracer.inject_headers(span))
 
     with tracer.span(span):
-        documents_indexed = int(collection.count())
+        documents_indexed = int(_documents_indexed)
         memory_usage_mb = psutil.Process(os.getpid()).memory_info().rss / (1024 * 1024)
 
     return HealthResponse(worker_id=WORKER_ID, documents_indexed=documents_indexed, memory_usage_mb=round(memory_usage_mb, 2))

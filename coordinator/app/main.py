@@ -36,6 +36,15 @@ redis_client = redis.Redis(host=REDIS_HOST, port=REDIS_PORT, decode_responses=Tr
 ring = ConsistentHashRing(nodes=WORKERS, vnodes=150)
 
 _health_monitor_task: asyncio.Task | None = None
+_http_client: httpx.AsyncClient | None = None
+
+
+def get_http_client() -> httpx.AsyncClient:
+    global _http_client
+    if _http_client is None or _http_client.is_closed:
+        limits = httpx.Limits(max_keepalive_connections=100, max_connections=300, keepalive_expiry=30.0)
+        _http_client = httpx.AsyncClient(limits=limits, timeout=REQUEST_TIMEOUT_S)
+    return _http_client
 
 
 class IngestRequest(BaseModel):
@@ -144,6 +153,14 @@ def _bump_cache_version() -> int:
     return int(redis_client.incr(QUERY_CACHE_VERSION_KEY))
 
 
+def _store_ingest_mapping(document_id: str, worker_id: str) -> int:
+    pipe = redis_client.pipeline(transaction=False)
+    pipe.set(document_id, worker_id)
+    pipe.incr(QUERY_CACHE_VERSION_KEY)
+    _, version = pipe.execute()
+    return int(version)
+
+
 def _query_cache_key(query: str, top_k: int) -> str:
     version = _get_cache_version()
     digest = sha256(f"{query}:{top_k}".encode("utf-8")).hexdigest()
@@ -230,9 +247,9 @@ async def _get_json(client: httpx.AsyncClient, worker_id: str, path: str) -> dic
 
 async def _health_monitor_loop() -> None:
     while True:
-        async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT_S) as client:
-            tasks = [_get_json(client, worker_id, "/health") for worker_id in WORKERS]
-            results = await asyncio.gather(*tasks, return_exceptions=True)
+        client = get_http_client()
+        tasks = [_get_json(client, worker_id, "/health") for worker_id in WORKERS]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
 
         for worker_id, result in zip(WORKERS, results):
             if isinstance(result, Exception):
@@ -246,16 +263,19 @@ async def _health_monitor_loop() -> None:
 @app.on_event("startup")
 async def startup_event() -> None:
     global _health_monitor_task
+    get_http_client()
     _health_monitor_task = asyncio.create_task(_health_monitor_loop())
 
 
 @app.on_event("shutdown")
 async def shutdown_event() -> None:
-    global _health_monitor_task
+    global _health_monitor_task, _http_client
     if _health_monitor_task is not None:
         _health_monitor_task.cancel()
         with suppress(asyncio.CancelledError):
             await _health_monitor_task
+    if _http_client is not None and not _http_client.is_closed:
+        await _http_client.aclose()
 
 
 @app.post("/ingest", response_model=IngestResponse)
@@ -267,35 +287,34 @@ async def ingest(payload: IngestRequest) -> IngestResponse:
         candidates = ring.get_nodes(payload.document_id, len(WORKERS))
         span_attrs["routing_candidates"] = candidates
 
-        async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT_S) as client:
-            last_exc: Exception | None = None
-            for worker_id in candidates:
-                if _is_degraded(worker_id):
-                    continue
+        client = get_http_client()
+        last_exc: Exception | None = None
+        for worker_id in candidates:
+            if _is_degraded(worker_id):
+                continue
 
-                child_span = tracer.create_span("coordinator.ingest.forward", TraceContext(root_span.trace_id, root_span.span_id))
-                with tracer.span(child_span, {"worker_id": worker_id}):
-                    try:
-                        trace_headers = tracer.inject_headers(child_span)
-                        worker_data, _ = await _post_json(client, worker_id, "/ingest", payload.model_dump(), trace_headers)
-                        await asyncio.to_thread(redis_client.set, payload.document_id, worker_id)
-                        await asyncio.to_thread(_bump_cache_version)
-                        total_latency_ms = (time.perf_counter() - start) * 1000.0
-                        span_attrs["worker_selected"] = worker_id
-                        span_attrs["routing_decision"] = f"hash->{worker_id}"
-                        span_attrs["total_latency_ms"] = total_latency_ms
-                        return IngestResponse(
-                            worker_id=worker_id,
-                            chunks_stored=int(worker_data.get("chunks_stored", 0)),
-                            total_latency_ms=total_latency_ms,
-                        )
-                    except httpx.TimeoutException as exc:
-                        last_exc = exc
-                        continue
-                    except Exception as exc:
-                        _mark_worker_degraded(worker_id, f"ingest_failed: {exc}")
-                        last_exc = exc
-                        continue
+            child_span = tracer.create_span("coordinator.ingest.forward", TraceContext(root_span.trace_id, root_span.span_id))
+            with tracer.span(child_span, {"worker_id": worker_id}):
+                try:
+                    trace_headers = tracer.inject_headers(child_span)
+                    worker_data, _ = await _post_json(client, worker_id, "/ingest", payload.model_dump(), trace_headers)
+                    await asyncio.to_thread(_store_ingest_mapping, payload.document_id, worker_id)
+                    total_latency_ms = (time.perf_counter() - start) * 1000.0
+                    span_attrs["worker_selected"] = worker_id
+                    span_attrs["routing_decision"] = f"hash->{worker_id}"
+                    span_attrs["total_latency_ms"] = total_latency_ms
+                    return IngestResponse(
+                        worker_id=worker_id,
+                        chunks_stored=int(worker_data.get("chunks_stored", 0)),
+                        total_latency_ms=total_latency_ms,
+                    )
+                except httpx.TimeoutException as exc:
+                    last_exc = exc
+                    continue
+                except Exception as exc:
+                    _mark_worker_degraded(worker_id, f"ingest_failed: {exc}")
+                    last_exc = exc
+                    continue
 
         if last_exc:
             raise httpx.HTTPError(f"all workers unavailable for ingest: {last_exc}")
@@ -321,15 +340,15 @@ async def query(payload: QueryRequest) -> QueryResponse:
         active_workers = [w for w in WORKERS if not _is_degraded(w)]
         span_attrs["workers_selected"] = active_workers
 
-        async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT_S) as client:
-            tasks = []
-            task_workers = []
-            for worker_id in active_workers:
-                worker_span = tracer.create_span("coordinator.query.forward", TraceContext(root_span.trace_id, root_span.span_id))
-                trace_headers = tracer.inject_headers(worker_span)
-                tasks.append(_post_json(client, worker_id, "/query", {"query": payload.query, "top_k": payload.top_k}, trace_headers))
-                task_workers.append((worker_id, worker_span))
-            responses = await asyncio.gather(*tasks, return_exceptions=True)
+        client = get_http_client()
+        tasks = []
+        task_workers = []
+        for worker_id in active_workers:
+            worker_span = tracer.create_span("coordinator.query.forward", TraceContext(root_span.trace_id, root_span.span_id))
+            trace_headers = tracer.inject_headers(worker_span)
+            tasks.append(_post_json(client, worker_id, "/query", {"query": payload.query, "top_k": payload.top_k}, trace_headers))
+            task_workers.append((worker_id, worker_span))
+        responses = await asyncio.gather(*tasks, return_exceptions=True)
 
         per_worker_latency: dict[str, float] = {}
         merged: list[QueryResult] = []
@@ -374,16 +393,16 @@ async def query(payload: QueryRequest) -> QueryResponse:
 async def ingest_batch(payload: BatchIngestRequest) -> BatchIngestResponse:
     start = time.perf_counter()
 
-    async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT_S) as client:
-        tasks = []
-        worker_by_doc: dict[str, str] = {}
+    client = get_http_client()
+    tasks = []
+    worker_by_doc: dict[str, str] = {}
 
-        for doc in payload.documents:
-            worker_id = ring.get_node(doc.document_id)
-            worker_by_doc[doc.document_id] = worker_id
-            tasks.append(_post_json(client, worker_id, "/ingest", doc.model_dump(), {}))
+    for doc in payload.documents:
+        worker_id = ring.get_node(doc.document_id)
+        worker_by_doc[doc.document_id] = worker_id
+        tasks.append(_post_json(client, worker_id, "/ingest", doc.model_dump(), {}))
 
-        responses = await asyncio.gather(*tasks, return_exceptions=True)
+    responses = await asyncio.gather(*tasks, return_exceptions=True)
 
     results: list[BatchDocumentStatus] = []
     redis_sets = []
@@ -418,9 +437,9 @@ async def ingest_batch(payload: BatchIngestRequest) -> BatchIngestResponse:
 
 @app.get("/cluster/status", response_model=ClusterStatusResponse)
 async def cluster_status() -> ClusterStatusResponse:
-    async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT_S) as client:
-        tasks = [client.get(_worker_url(worker_id, "/health")) for worker_id in WORKERS]
-        responses = await asyncio.gather(*tasks, return_exceptions=True)
+    client = get_http_client()
+    tasks = [client.get(_worker_url(worker_id, "/health")) for worker_id in WORKERS]
+    responses = await asyncio.gather(*tasks, return_exceptions=True)
 
     workers: dict[str, WorkerHealth] = {}
 
