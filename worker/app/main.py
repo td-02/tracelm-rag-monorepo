@@ -22,6 +22,7 @@ EMBED_DIMENSION = int(os.getenv("EMBED_DIMENSION", "384"))
 
 CHROMA_COLLECTION = os.getenv("CHROMA_COLLECTION", WORKER_ID)
 tracer = init_tracer(service_name=WORKER_ID)
+process = psutil.Process(os.getpid())
 _collection_lock = threading.Lock()
 _collection = None
 _documents_indexed = 0
@@ -237,6 +238,6 @@ def health(
 
     with tracer.span(span):
         documents_indexed = int(_documents_indexed)
-        memory_usage_mb = psutil.Process(os.getpid()).memory_info().rss / (1024 * 1024)
+        memory_usage_mb = process.memory_info().rss / (1024 * 1024)
 
     return HealthResponse(worker_id=WORKER_ID, documents_indexed=documents_indexed, memory_usage_mb=round(memory_usage_mb, 2))

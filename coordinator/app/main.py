@@ -161,6 +161,15 @@ def _store_ingest_mapping(document_id: str, worker_id: str) -> int:
     return int(version)
 
 
+def _store_batch_ingest_mappings(items: list[tuple[str, str]]) -> int:
+    pipe = redis_client.pipeline(transaction=False)
+    for document_id, worker_id in items:
+        pipe.set(document_id, worker_id)
+    pipe.incr(QUERY_CACHE_VERSION_KEY)
+    results = pipe.execute()
+    return int(results[-1])
+
+
 def _query_cache_key(query: str, top_k: int) -> str:
     version = _get_cache_version()
     digest = sha256(f"{query}:{top_k}".encode("utf-8")).hexdigest()
@@ -405,7 +414,7 @@ async def ingest_batch(payload: BatchIngestRequest) -> BatchIngestResponse:
     responses = await asyncio.gather(*tasks, return_exceptions=True)
 
     results: list[BatchDocumentStatus] = []
-    redis_sets = []
+    successful_mappings: list[tuple[str, str]] = []
 
     for doc, result in zip(payload.documents, responses):
         worker_id = worker_by_doc[doc.document_id]
@@ -426,10 +435,10 @@ async def ingest_batch(payload: BatchIngestRequest) -> BatchIngestResponse:
                 latency_ms=latency_ms,
             )
         )
+        successful_mappings.append((doc.document_id, worker_id))
 
-    if redis_sets:
-        await asyncio.gather(*redis_sets)
-    await asyncio.to_thread(_bump_cache_version)
+    if successful_mappings:
+        await asyncio.to_thread(_store_batch_ingest_mappings, successful_mappings)
 
     total_latency_ms = (time.perf_counter() - start) * 1000.0
     return BatchIngestResponse(results=results, total_latency_ms=total_latency_ms)
