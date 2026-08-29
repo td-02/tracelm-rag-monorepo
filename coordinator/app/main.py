@@ -23,6 +23,8 @@ WORKERS = [w.strip() for w in os.getenv("WORKERS", "worker1,worker2,worker3").sp
 WORKER_PORT = int(os.getenv("WORKER_PORT", "8000"))
 REQUEST_TIMEOUT_S = float(os.getenv("REQUEST_TIMEOUT_S", "30"))
 QUERY_CACHE_TTL_S = int(os.getenv("QUERY_CACHE_TTL_S", "60"))
+HTTP_MAX_KEEPALIVE_CONNECTIONS = int(os.getenv("HTTP_MAX_KEEPALIVE_CONNECTIONS", "150"))
+HTTP_MAX_CONNECTIONS = int(os.getenv("HTTP_MAX_CONNECTIONS", "600"))
 
 DEGRADED_WORKERS_KEY = "cluster:degraded_workers"
 FAILOVER_LOG_KEY = "cluster:failover_log"
@@ -42,7 +44,11 @@ _http_client: httpx.AsyncClient | None = None
 def get_http_client() -> httpx.AsyncClient:
     global _http_client
     if _http_client is None or _http_client.is_closed:
-        limits = httpx.Limits(max_keepalive_connections=100, max_connections=300, keepalive_expiry=30.0)
+        limits = httpx.Limits(
+            max_keepalive_connections=HTTP_MAX_KEEPALIVE_CONNECTIONS,
+            max_connections=HTTP_MAX_CONNECTIONS,
+            keepalive_expiry=30.0,
+        )
         _http_client = httpx.AsyncClient(limits=limits, timeout=REQUEST_TIMEOUT_S)
     return _http_client
 
