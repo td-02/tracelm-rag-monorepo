@@ -1,5 +1,6 @@
 import asyncio
 import json
+import os
 import statistics
 import time
 from collections import Counter
@@ -16,6 +17,11 @@ WORKER_URLS = {
     "worker_3": "http://localhost:8003",
 }
 RESULTS_PATH = Path("benchmark_results.json")
+STRESS_MAX_CONCURRENCY = int(os.getenv("STRESS_MAX_CONCURRENCY", "500"))
+STRESS_RAMP_STEP = int(os.getenv("STRESS_RAMP_STEP", "50"))
+STRESS_ROUNDS_PER_LEVEL = int(os.getenv("STRESS_ROUNDS_PER_LEVEL", "100"))
+STRESS_P95_BREAKPOINT_MS = float(os.getenv("STRESS_P95_BREAKPOINT_MS", "2500"))
+STRESS_ERROR_RATE_BREAKPOINT = float(os.getenv("STRESS_ERROR_RATE_BREAKPOINT", "0.02"))
 
 
 def percentile(values: list[float], p: float) -> float:
@@ -276,6 +282,67 @@ async def experiment_5_query_cache_effectiveness(client: httpx.AsyncClient) -> d
     }
 
 
+async def experiment_6_stress_limit(client: httpx.AsyncClient) -> dict[str, Any]:
+    query_text = "absolute limit stress query"
+    top_k = 5
+    peak_concurrency = 0
+    stop_reason = "max_concurrency_reached"
+    level_summaries: list[dict[str, Any]] = []
+
+    for concurrency in range(STRESS_RAMP_STEP, STRESS_MAX_CONCURRENCY + 1, STRESS_RAMP_STEP):
+        latencies: list[float] = []
+        errors = 0
+        sem = asyncio.Semaphore(concurrency)
+
+        async def run_one(i: int) -> None:
+            nonlocal errors
+            payload = {"query": f"{query_text} {concurrency} {i}", "top_k": top_k, "use_cache": False}
+            async with sem:
+                t0 = time.perf_counter()
+                try:
+                    resp = await client.post(f"{COORDINATOR_URL}/query", json=payload)
+                    resp.raise_for_status()
+                    latencies.append((time.perf_counter() - t0) * 1000.0)
+                except Exception:
+                    errors += 1
+
+        await asyncio.gather(*(run_one(i) for i in range(STRESS_ROUNDS_PER_LEVEL)))
+
+        total = STRESS_ROUNDS_PER_LEVEL
+        error_rate = errors / total if total else 0.0
+        p95 = percentile(latencies, 0.95) if latencies else 0.0
+        avg = statistics.mean(latencies) if latencies else 0.0
+        peak_concurrency = concurrency
+        level_summaries.append(
+            {
+                "concurrency": concurrency,
+                "avg_ms": avg,
+                "p95_ms": p95,
+                "error_rate": error_rate,
+                "successes": total - errors,
+                "failures": errors,
+            }
+        )
+
+        if error_rate >= STRESS_ERROR_RATE_BREAKPOINT:
+            stop_reason = "error_rate_breakpoint"
+            break
+        if p95 >= STRESS_P95_BREAKPOINT_MS:
+            stop_reason = "latency_breakpoint"
+            break
+
+    return {
+        "max_concurrency_requested": STRESS_MAX_CONCURRENCY,
+        "ramp_step": STRESS_RAMP_STEP,
+        "rounds_per_level": STRESS_ROUNDS_PER_LEVEL,
+        "breakpoint_p95_ms": STRESS_P95_BREAKPOINT_MS,
+        "breakpoint_error_rate": STRESS_ERROR_RATE_BREAKPOINT,
+        "peak_concurrency_tested": peak_concurrency,
+        "stop_reason": stop_reason,
+        "levels": level_summaries,
+    }
+
+
 def print_table(results: dict[str, Any]) -> None:
     rows = [
         (
@@ -303,6 +370,11 @@ def print_table(results: dict[str, Any]) -> None:
             f"uncached={results['experiment_5_query_cache_effectiveness']['uncached']['avg_ms']:.1f}ms cached={results['experiment_5_query_cache_effectiveness']['cached']['avg_ms']:.1f}ms",
             f"speedup={results['experiment_5_query_cache_effectiveness']['speedup_ratio']:.2f}x hits={results['experiment_5_query_cache_effectiveness']['cache_hits']}/{results['experiment_5_query_cache_effectiveness']['cache_requests']}",
         ),
+        (
+            "Exp6 Stress Limit",
+            f"peak={results['experiment_6_stress_limit']['peak_concurrency_tested']} stop={results['experiment_6_stress_limit']['stop_reason']}",
+            f"last_p95={results['experiment_6_stress_limit']['levels'][-1]['p95_ms']:.1f}ms last_err={results['experiment_6_stress_limit']['levels'][-1]['error_rate']*100:.1f}%",
+        ),
     ]
 
     print("\nBenchmark Results")
@@ -323,6 +395,7 @@ async def main() -> None:
             "experiment_3_fault_tolerance": await experiment_3_fault_tolerance(client),
             "experiment_4_scatter_gather_overhead": await experiment_4_scatter_gather_overhead(client),
             "experiment_5_query_cache_effectiveness": await experiment_5_query_cache_effectiveness(client),
+            "experiment_6_stress_limit": await experiment_6_stress_limit(client),
             "generated_at_epoch": time.time(),
         }
 

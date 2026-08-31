@@ -98,12 +98,21 @@ python scripts/benchmark.py
 Produces:
 
 - `benchmark_results.json`
-- console summary table for 5 experiments:
+- console summary table for 6 experiments:
   - ingestion speed
   - query latency under load
   - fault tolerance under node failure
   - scatter-gather overhead
   - query cache effectiveness
+  - stress limit ramp to failure thresholds
+
+Optional stress controls:
+
+- `STRESS_MAX_CONCURRENCY` sets the upper bound for the ramp
+- `STRESS_RAMP_STEP` sets how aggressively the load increases
+- `STRESS_ROUNDS_PER_LEVEL` sets the request count per concurrency level
+- `STRESS_P95_BREAKPOINT_MS` stops the ramp once tail latency crosses this threshold
+- `STRESS_ERROR_RATE_BREAKPOINT` stops the ramp once failures cross this threshold
 
 ## Benchmark Results
 
