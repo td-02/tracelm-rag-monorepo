@@ -114,6 +114,35 @@ Optional stress controls:
 - `STRESS_P95_BREAKPOINT_MS` stops the ramp once tail latency crosses this threshold
 - `STRESS_ERROR_RATE_BREAKPOINT` stops the ramp once failures cross this threshold
 
+### Run the maximum stress profile
+
+Start the stack first, then run the following profile from a separate terminal. It
+ramps to 5,000 concurrent uncached queries in increments of 250, with 1,000
+requests at each level. The run stops when the error rate reaches 2% or P95
+latency reaches 2.5 seconds, which protects the host while still identifying
+the system's practical saturation point.
+
+```bash
+STRESS_MAX_CONCURRENCY=5000 \\
+STRESS_RAMP_STEP=250 \\
+STRESS_ROUNDS_PER_LEVEL=1000 \\
+STRESS_P95_BREAKPOINT_MS=2500 \\
+STRESS_ERROR_RATE_BREAKPOINT=0.02 \\
+python scripts/benchmark.py
+```
+
+The final `Exp6 Stress Limit` row reports the last completed concurrency level,
+its P95 latency and error rate, plus the breakpoint that stopped the ramp. The
+full per-level results are saved to `benchmark_results.json` under
+`experiment_6_stress_limit`.
+
+### Latest stress-run status
+
+No live stress result is recorded as of 2026-09-18: Docker Engine was not
+available in the benchmark environment and the coordinator was not reachable at
+`http://localhost:8000`. The benchmark script passed Python syntax validation;
+run the command above after Docker is running to publish a measured limit.
+
 ## Benchmark Results
 
 | Experiment | Key Metrics | Notes |
